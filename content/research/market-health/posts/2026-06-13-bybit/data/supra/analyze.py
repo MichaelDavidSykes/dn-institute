@@ -247,18 +247,37 @@ def slice_rows(
     )
 
 
-def boundary_range(rows: Sequence[Trade], cadence_ms: int = 300_000) -> range:
-    """Return anchors observed by the dated archives, not by trade activity.
+def boundary_range(
+    rows: Sequence[Trade],
+    cadence_ms: int = 300_000,
+    *,
+    phase_seconds: int = 0,
+    window_start_ms: int = PRE_START_MS,
+    window_end_ms: int = POST_END_MS,
+) -> range:
+    """Return shifted anchors whose complete test window is in the archives."""
+    if not rows:
+        raise ValueError("boundary range requires at least one dated trade")
+    if cadence_ms <= 0:
+        raise ValueError("cadence must be positive")
+    phase_ms = phase_seconds * 1000
+    if not 0 <= phase_ms < cadence_ms:
+        raise ValueError("phase must be within one cadence")
+    if window_start_ms >= window_end_ms:
+        raise ValueError("window start must precede window end")
 
-    The first anchor is excluded because its pre-boundary band precedes the
-    archive window.  A quiet start or end of a symbol's tape must not remove
-    otherwise observable zero-hit anchors from the denominator.
-    """
     dates = [dt.date.fromisoformat(row.date) for row in rows]
     start_ms = (min(dates) - dt.date(1970, 1, 1)).days * DAY_MS
     end_ms = ((max(dates) + dt.timedelta(days=1)) - dt.date(1970, 1, 1)).days * DAY_MS
-    first = (start_ms // cadence_ms + 1) * cadence_ms
-    return range(first, end_ms, cadence_ms)
+    lower_anchor = start_ms - window_start_ms
+    upper_anchor = end_ms - window_end_ms
+    first_index = -(-(lower_anchor - phase_ms) // cadence_ms)
+    stop_index = (upper_anchor - phase_ms) // cadence_ms + 1
+    return range(
+        phase_ms + first_index * cadence_ms,
+        phase_ms + stop_index * cadence_ms,
+        cadence_ms,
+    )
 
 
 def build_boundary_events(
@@ -273,8 +292,13 @@ def build_boundary_events(
     timestamps = [row.timestamp for row in rows]
     events: List[BoundaryEvent] = []
     possible = 0
-    for base_boundary in boundary_range(rows, cadence_ms):
-        boundary = base_boundary + phase_seconds * 1000
+    for boundary in boundary_range(
+        rows,
+        cadence_ms,
+        phase_seconds=phase_seconds,
+        window_start_ms=min(pre_start_ms, post_start_ms),
+        window_end_ms=max(pre_end_ms, post_end_ms),
+    ):
         possible += 1
         pre_rows = slice_rows(
             rows, timestamps, boundary + pre_start_ms, boundary + pre_end_ms
@@ -307,8 +331,13 @@ def count_wide_hits(
     timestamps = [row.timestamp for row in rows]
     hits = 0
     possible = 0
-    for base_boundary in boundary_range(rows, cadence_ms):
-        boundary = base_boundary + phase_seconds * 1000
+    for boundary in boundary_range(
+        rows,
+        cadence_ms,
+        phase_seconds=phase_seconds,
+        window_start_ms=WIDE_START_MS,
+        window_end_ms=WIDE_END_MS,
+    ):
         possible += 1
         left = bisect.bisect_left(timestamps, boundary + WIDE_START_MS)
         right = bisect.bisect_left(timestamps, boundary + WIDE_END_MS)
@@ -700,7 +729,17 @@ def read_csv(path: Path) -> List[dict]:
         return list(csv.DictReader(handle))
 
 
-def generate_charts(output_dir: Path) -> None:
+def chart_output_directory(output_dir: Path) -> Path:
+    """Keep custom runs self-contained while preserving the article layout."""
+    default_output_dir = Path(__file__).resolve().parent
+    return (
+        default_output_dir.parent.parent
+        if output_dir.resolve() == default_output_dir
+        else output_dir
+    )
+
+
+def generate_charts(output_dir: Path, chart_dir: Path) -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mtick
@@ -723,6 +762,7 @@ def generate_charts(output_dir: Path) -> None:
         }
     )
 
+    chart_dir.mkdir(parents=True, exist_ok=True)
     seconds = read_csv(output_dir / "second_of_minute.csv")
     fig, ax = plt.subplots(figsize=(12, 6.6), dpi=140)
     for symbol in SYMBOLS:
@@ -743,7 +783,7 @@ def generate_charts(output_dir: Path) -> None:
     ax.grid(axis="y", alpha=0.18)
     ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
-    fig.savefig(output_dir.parent.parent / "supra-second-of-minute.png", bbox_inches="tight")
+    fig.savefig(chart_dir / "supra-second-of-minute.png", bbox_inches="tight")
     plt.close(fig)
 
     offsets = read_csv(output_dir / "boundary_offset_10ms.csv")
@@ -770,7 +810,7 @@ def generate_charts(output_dir: Path) -> None:
     ax.grid(axis="y", alpha=0.18)
     ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(output_dir.parent.parent / "supra-boundary-offset.png", bbox_inches="tight")
+    fig.savefig(chart_dir / "supra-boundary-offset.png", bbox_inches="tight")
     plt.close(fig)
 
     daily = read_csv(output_dir / "daily_timing.csv")
@@ -809,7 +849,7 @@ def generate_charts(output_dir: Path) -> None:
     bottom.set_xlim(-1, 300)
     bottom.grid(axis="y", alpha=0.18)
     fig.tight_layout(h_pad=2.0)
-    fig.savefig(output_dir.parent.parent / "supra-boundary-robustness.png", bbox_inches="tight")
+    fig.savefig(chart_dir / "supra-boundary-robustness.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -851,6 +891,14 @@ def verify_outputs(output_dir: Path) -> None:
     phase_zero = next(
         row for row in phases if row["phase_seconds_after_five_minute_boundary"] == "0"
     )
+    for row in phases:
+        phase = int(row["phase_seconds_after_five_minute_boundary"])
+        expected_anchors = 8_639 if phase == 0 else 8_640
+        if int(row["possible_anchors"]) != expected_anchors:
+            raise AssertionError(
+                f"phase {phase}: expected {expected_anchors} anchors, "
+                f"found {row['possible_anchors']}"
+            )
     if int(phase_zero["core_both_legs_boundaries"]) != 7932:
         raise AssertionError("phase-zero paired-event count changed")
     nonoverlapping = [
@@ -892,6 +940,15 @@ def verify_pinned_sources(expected: Sequence[dict], observed: Sequence[dict]) ->
                 )
 
 
+def read_required_pinned_manifest(path: Path) -> List[dict]:
+    """Load the committed source manifest or fail before verification work."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"--verify requires the committed source manifest: {path}"
+        )
+    return read_csv(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -914,9 +971,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pinned_manifest_path = Path(__file__).resolve().parent / "source_manifest.csv"
     pinned_manifest = (
-        read_csv(pinned_manifest_path)
-        if args.verify and pinned_manifest_path.exists()
-        else None
+        read_required_pinned_manifest(pinned_manifest_path) if args.verify else None
     )
     all_rows: Dict[str, List[Trade]] = {}
     manifest: List[dict] = []
@@ -968,7 +1023,7 @@ def main() -> None:
     write_csv(args.output_dir / "sensitivity.csv", sensitivity_rows(all_rows[TARGET]))
 
     if not args.skip_charts:
-        generate_charts(args.output_dir)
+        generate_charts(args.output_dir, chart_output_directory(args.output_dir))
     if args.verify:
         verify_outputs(args.output_dir)
 

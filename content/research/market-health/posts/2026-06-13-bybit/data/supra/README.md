@@ -3,6 +3,9 @@
 This directory contains the processed data and reproducible analysis behind the
 SUPRA/USDT section of the Bybit market-health article. Raw archives are not
 committed. `source_manifest.csv` pins all 90 dated inputs by URL and SHA-256.
+The separate [`discovery/`](./discovery/) package pins the exact 80-pair search
+cohort, 240 dated inputs and complete exploratory output that led to the SUPRA
+follow-up, together with the original live-ticker snapshot limitation.
 
 ## Reproduce
 
@@ -45,7 +48,14 @@ days were inspected while formalising the narrow bands. CITY/USDT and
 PYBOBO/USDT are post-selected activity comparators, not labelled ground truth or
 an unbiased control sample. The full SUPRA within-pair phase placebo tests all
 300 one-second phases of a five-minute cycle; phase 299's wide hit window
-overlaps the next boundary's pre-leg and is explicitly marked in the CSV.
+overlaps the next boundary's pre-leg and is explicitly marked in the CSV. Phase
+zero has 8,639 fully observed anchors because the opening pre-window precedes
+the sample; phases 1-299 each have 8,640 because their shifted opening windows
+fall inside the sample.
+
+With the repository-default output directory, charts are written beside the
+article. A custom `--output-dir` keeps both generated CSVs and charts inside
+that directory, making temporary verification runs self-contained.
 
 ## Outputs
 
